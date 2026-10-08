@@ -15,6 +15,12 @@ import os, sys, importlib, subprocess
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).parent
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(PROJECT_DIR / ".env")
+except ImportError:
+    pass
 PASS = "✓"
 FAIL = "✗"
 WARN = "⚠"

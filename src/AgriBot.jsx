@@ -1082,8 +1082,11 @@ export default function AgriBot({ username = "user", email = "", token, onLogout
     };
 
     es.onerror = () => {
-      // Connection dropped (e.g. server restarted) — stop trying rather
-      // than spamming reconnects against a request that already finished.
+      // Connection dropped (e.g. server restarted) or never opened (e.g.
+      // the route 404'd / was swallowed by another handler) — surface it
+      // instead of leaving the panel stuck on "CONNECTING…" forever.
+      setExecStatus(prev => (prev === "completed" ? prev : "error"));
+      setExecError(prev => prev || "Lost connection to the server.");
       es.close();
     };
 

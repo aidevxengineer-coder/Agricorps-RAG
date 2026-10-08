@@ -1463,6 +1463,7 @@ import time
 import uuid
 import traceback
 import json
+import re
 import shutil
 from contextlib import redirect_stdout
 from typing import Optional, List, Dict
@@ -1478,6 +1479,13 @@ from pydantic import BaseModel
 import requests as _requests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Load variables from .env into the process environment. Without this, edits to
+# .env (e.g. rotating GROQ_API_KEY) never take effect — os.environ.get() below
+# would keep seeing whatever was set in the shell that launched uvicorn, or
+# nothing at all.
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 # Ensure stdout/stderr use UTF-8 where possible (prevents UnicodeEncodeError on Windows
 # when code prints emoji or other non-encodable characters). This is a surgical runtime fix
@@ -1546,10 +1554,14 @@ try:
     from mcp_pdf_export import mcp_generate_pdf as _mcp_pdf
     _PDF_EXPORT_AVAILABLE = True
     print("[STARTUP] mcp_pdf_export loaded — PDF export enabled")
-except ImportError as e:
+except Exception as e:
+    # Broad on purpose: weasyprint can raise OSError (not ImportError) when
+    # its native GTK libs are missing, which otherwise escapes this guard
+    # and crashes the entire api_server module before uvicorn can serve
+    # anything — not just PDF export.
     _PDF_EXPORT_AVAILABLE = False
     _mcp_pdf = None
-    print(f"[STARTUP] mcp_pdf_export not found — PDF export disabled ({e})")
+    print(f"[STARTUP] mcp_pdf_export not available — PDF export disabled ({e})")
 
 # ── STT (Stage 2: speech-to-text, validated standalone before this wiring) ─
 try:
@@ -1599,14 +1611,14 @@ from fastapi.responses import JSONResponse as _JSONResponse
 @app.exception_handler(Exception)
 async def _global_exception_handler(request, exc):
     try:
-        friendly = _friendly_error(exc)
+        return _api_error_response(exc)
     except Exception:
         friendly = f"❌ Backend error: {type(exc).__name__}: {exc}"
-    return _JSONResponse(status_code=500, content={
-        "response": friendly,
-        "trace": None,
-        "error_detail": str(exc),
-    })
+        return _JSONResponse(status_code=500, content={
+            "response": friendly,
+            "trace": None,
+            "error_detail": friendly,
+        })
 
 app.add_middleware(
     CORSMiddleware,
@@ -2207,7 +2219,24 @@ def _execute_query(session_id: str,
 
 def _friendly_error(exc: Exception) -> str:
     msg = str(exc)
-    if any(kw in msg.lower() for kw in
+    lower = msg.lower()
+    if any(kw in lower for kw in
+           ("usage limit", "rate limit", "rate_limit", "quota", "429")):
+        # rag_pipeline already converts Groq's verbose 429 payload into a
+        # useful sentence. Preserve that text when the agent harness wraps it.
+        if "agribot has reached" in lower:
+            return msg
+        return (
+            "AgriBot has reached the current AI-model usage limit. "
+            "Please wait and try again, or configure another available model."
+        )
+    if any(kw in lower for kw in
+           ("invalid api key", "authentication", "groq_api_key not set", "401")):
+        return (
+            "AgriBot's AI backend is not configured correctly. "
+            "Please check GROQ_API_KEY in the server environment."
+        )
+    if any(kw in lower for kw in
            ("connection", "10054", "reset", "aborted", "timeout")):
         return (
             "⚠️ The remote model connection dropped mid-response. "
@@ -2215,6 +2244,58 @@ def _friendly_error(exc: Exception) -> str:
             "If it keeps happening, the Qwen server/tunnel may need restarting."
         )
     return f"❌ Backend error: {type(exc).__name__}: {exc}"
+
+
+def _api_error_status(exc: Exception) -> int:
+    """Map expected upstream failures to meaningful HTTP status codes."""
+    msg = str(exc).lower()
+    if any(kw in msg for kw in
+           ("usage limit", "rate limit", "rate_limit", "quota", "429")):
+        return 429
+    if any(kw in msg for kw in
+           ("invalid api key", "authentication", "groq_api_key not set", "401")):
+        # Provider credentials are a server configuration problem, not a
+        # browser-user authentication failure.
+        return 503
+    if "timeout" in msg or "timed out" in msg:
+        return 504
+    if any(kw in msg for kw in ("connection", "10054", "reset", "aborted")):
+        return 503
+    return 500
+
+
+def _retry_after_seconds(exc: Exception) -> Optional[int]:
+    """Extract the provider's suggested retry delay from a friendly error."""
+    match = re.search(
+        r"try again in\s+(?:about\s+)?([\d.]+)\s*(minute|second|[ms])",
+        str(exc),
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    value, unit = match.groups()
+    seconds = float(value) * (60 if unit.lower().startswith("m") else 1)
+    return max(1, int(seconds))
+
+
+def _api_error_response(exc: Exception, execution_id: Optional[str] = None):
+    """Return the consistent JSON error shape consumed by the React UI."""
+    status = _api_error_status(exc)
+    friendly = _friendly_error(exc)
+    headers = {}
+    retry_after = _retry_after_seconds(exc) if status == 429 else None
+    if retry_after is not None:
+        headers["Retry-After"] = str(retry_after)
+
+    content = {
+        "response": friendly,
+        "trace": None,
+        # Do not expose exception class names or provider payloads to users.
+        "error_detail": friendly,
+    }
+    if execution_id:
+        content["execution_id"] = execution_id
+    return JSONResponse(status_code=status, content=content, headers=headers)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2336,15 +2417,15 @@ def chat(req: ChatRequest):
             execution_id=execution_id,
         )
     except Exception as exc:
-        print("\n" + "="*70)
-        print("[ERROR] /api/chat failed")
-        traceback.print_exc()
-        print("="*70 + "\n")
-        return JSONResponse(
-            status_code=500,
-            content={"response": _friendly_error(exc),
-                     "trace": None, "error_detail": str(exc)},
-        )
+        status = _api_error_status(exc)
+        if status == 500:
+            print("\n" + "="*70)
+            print("[ERROR] /api/chat failed")
+            traceback.print_exc()
+            print("="*70 + "\n")
+        else:
+            print(f"[CHAT] upstream error ({status}): {_friendly_error(exc)}")
+        return _api_error_response(exc, execution_id=execution_id)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2436,15 +2517,15 @@ def chat_dynamic(req: ChatRequest):
             "execution_id": execution_id,
         }
     except Exception as exc:
-        print("\n" + "="*70)
-        print("[ERROR] /api/chat/dynamic failed")
-        traceback.print_exc()
-        print("="*70 + "\n")
-        return JSONResponse(
-            status_code=500,
-            content={"response": _friendly_error(exc),
-                     "trace": None, "error_detail": str(exc)},
-        )
+        status = _api_error_status(exc)
+        if status == 500:
+            print("\n" + "="*70)
+            print("[ERROR] /api/chat/dynamic failed")
+            traceback.print_exc()
+            print("="*70 + "\n")
+        else:
+            print(f"[CHAT/DYNAMIC] upstream error ({status}): {_friendly_error(exc)}")
+        return _api_error_response(exc, execution_id=execution_id)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3413,6 +3494,20 @@ def download_artifact(execution_id: str):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  Entry point
+# ═══════════════════════════════════════════════════════════════════════════════
+# Must be included BEFORE the SPA catch-all route below — Starlette matches
+# routes in registration order, so if "/{full_path:path}" were registered
+# first it would swallow every /agent/* request (including the SSE endpoint
+# the Agent Execution panel depends on) and serve index.html instead.
+try:
+    from agent_harness import router as agent_harness_router
+    app.include_router(agent_harness_router)
+    print("[HARNESS] agent_harness.router included")
+except Exception as e:
+    print(f"[HARNESS] agent_harness router failed to import: {e}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  Serve React build
 # ═══════════════════════════════════════════════════════════════════════════════
 DIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dist")
@@ -3424,17 +3519,6 @@ if os.path.isdir(DIST):
     @app.get("/{full_path:path}")
     def serve_spa(full_path: str):
         return FileResponse(os.path.join(DIST, "index.html"))
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Entry point
-# ═══════════════════════════════════════════════════════════════════════════════
-try:
-    from agent_harness import router as agent_harness_router
-    app.include_router(agent_harness_router)
-    print("[HARNESS] agent_harness.router included")
-except Exception as e:
-    print(f"[HARNESS] agent_harness router failed to import: {e}")
 
 # ── Bridge for calling harness workflows (async) from sync endpoints ────────
 # WHY: /api/chat and /api/sessions/{id}/export/pdf are plain `def` (sync)

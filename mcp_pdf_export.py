@@ -56,10 +56,16 @@ from agent_harness.tracer import trace_execution
 
 
 # ── Try weasyprint (optional — graceful fallback to HTML) ─────────────────────
+# NOTE: catching Exception, not just ImportError — on Windows, weasyprint is
+# importable as a package but fails at import time with OSError if the native
+# GTK libs (libgobject-2.0-0.dll etc.) aren't installed. An ImportError-only
+# guard lets that OSError escape, which crashes this entire module (and, via
+# api_server.py's own import of it, the whole API server) instead of falling
+# back to the documented HTML-only behavior.
 try:
     from weasyprint import HTML as _WeasyprintHTML
     _WEASYPRINT = True
-except ImportError:
+except Exception:
     _WEASYPRINT = False
 
 

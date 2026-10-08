@@ -38,6 +38,11 @@ import argparse
 # Add pipeline directory to path
 sys.path.insert(0, os.path.dirname(__file__))
 
+# Load variables from .env into the process environment so GROQ_API_KEY etc.
+# don't have to be exported manually in the shell.
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
 print("IMPORT db_schema")
 import db_schema
 print("DONE db_schema")

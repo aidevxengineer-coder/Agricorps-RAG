@@ -27,6 +27,7 @@ API surface (unchanged — fully backward-compatible):
 import os
 import sys
 import uuid
+import threading
 from typing import List, Dict, Any, Tuple, Union
 
 import chromadb
@@ -66,6 +67,14 @@ EMBEDDING_MODEL = os.environ.get(
 _client: chromadb.PersistentClient = None
 _collection = None
 _ef = None
+# FastAPI runs sync `def` endpoints in a thread pool, so concurrent requests
+# (e.g. the frontend's /api/status poll firing from multiple tabs right after
+# a restart) can all see these as None at once and race to initialize
+# ChromaDB simultaneously — which surfaces as "Could not connect to tenant
+# default_tenant", caught by collection_size()'s except-and-return-0 and
+# misreported as an empty knowledge base. This lock serializes init only;
+# once the singletons are set, readers skip it entirely.
+_init_lock = threading.RLock()  # RLock: _get_collection() re-enters via _get_client()/_get_ef()
 
 
 # ── Embedding function ─────────────────────────────────────────────────────────
@@ -79,40 +88,64 @@ def _get_ef():
     Requires:  pip install sentence-transformers
     """
     global _ef
-    if _ef is None:
-        size_hint = "~278 MB" if "e5-base" in EMBEDDING_MODEL else "~117 MB" if "e5-small" in EMBEDDING_MODEL else "varies"
-        print(f"[VECTOR] Loading '{EMBEDDING_MODEL}' locally "
-              f"(first download {size_hint}, then instant from cache)...")
-        _ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=EMBEDDING_MODEL,
-            device="cpu",
-        )
-        print("[VECTOR] Embedding model ready.")
+    if _ef is not None:
+        return _ef
+    with _init_lock:
+        if _ef is None:
+            size_hint = "~278 MB" if "e5-base" in EMBEDDING_MODEL else "~117 MB" if "e5-small" in EMBEDDING_MODEL else "varies"
+            print(f"[VECTOR] Loading '{EMBEDDING_MODEL}' locally "
+                  f"(first download {size_hint}, then instant from cache)...")
+            try:
+                _ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+                    model_name=EMBEDDING_MODEL,
+                    device="cpu",
+                )
+                print("[VECTOR] Embedding model ready.")
+            except Exception as exc:
+                # Some managed Windows machines block native DLLs (torch, sklearn,
+                # etc.) via Application Control. Depending on exactly which DLL
+                # gets touched first, sentence_transformers/chromadb can surface
+                # that as OSError, ImportError, or (observed: sklearn's blocked
+                # _expected_mutual_info_fast.pyd) a plain ValueError raised by
+                # chromadb's own wrapper — so this must catch broadly, not just
+                # (ImportError, OSError), or an uncaught exception here bubbles
+                # all the way up to collection_size()'s except-and-return-0,
+                # which then misreports a perfectly populated collection as an
+                # empty knowledge base.
+                print(f"[VECTOR] SentenceTransformer unavailable ({exc}).")
+                print("[VECTOR] Falling back to Chroma's ONNX embedding model.")
+                _ef = embedding_functions.DefaultEmbeddingFunction()
     return _ef
 
 
 def _get_client() -> chromadb.PersistentClient:
     global _client
-    if _client is None:
-        os.makedirs(CHROMA_DIR, exist_ok=True)
-        _client = chromadb.PersistentClient(path=CHROMA_DIR)
-        print(f"[VECTOR] ChromaDB initialized at {CHROMA_DIR}")
+    if _client is not None:
+        return _client
+    with _init_lock:
+        if _client is None:
+            os.makedirs(CHROMA_DIR, exist_ok=True)
+            _client = chromadb.PersistentClient(path=CHROMA_DIR)
+            print(f"[VECTOR] ChromaDB initialized at {CHROMA_DIR}")
     return _client
 
 
 def _get_collection():
     """Return (or create) the main ChromaDB collection with bge-m3 embeddings."""
     global _collection
-    if _collection is None:
-        client = _get_client()
-        ef     = _get_ef()
-        _collection = client.get_or_create_collection(
-            name=COLLECTION_NAME,
-            embedding_function=ef,
-            metadata={"hnsw:space": "cosine"},
-        )
-        print(f"[VECTOR] Collection '{COLLECTION_NAME}' ready "
-              f"({_collection.count()} documents)")
+    if _collection is not None:
+        return _collection
+    with _init_lock:
+        if _collection is None:
+            client = _get_client()
+            ef     = _get_ef()
+            _collection = client.get_or_create_collection(
+                name=COLLECTION_NAME,
+                embedding_function=ef,
+                metadata={"hnsw:space": "cosine"},
+            )
+            print(f"[VECTOR] Collection '{COLLECTION_NAME}' ready "
+                  f"({_collection.count()} documents)")
     return _collection
 
 
@@ -121,7 +154,12 @@ def _get_collection():
 def collection_size() -> int:
     try:
         return _get_collection().count()
-    except Exception:
+    except Exception as exc:
+        # Logged rather than swallowed silently — a real failure here (e.g.
+        # the embedding function couldn't load) previously looked identical
+        # to a genuinely empty collection, sending users to re-index data
+        # that was never actually missing.
+        print(f"[VECTOR] collection_size() failed, reporting 0: {exc}")
         return 0
 
 
